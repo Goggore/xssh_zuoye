@@ -1,10 +1,8 @@
 #include <unistd.h>
 #include <stdio.h>
-#include <fcntl.h>
 #include <stdlib.h>
 #include <memory.h>
-#include <string.h>
-#include <tic.h>
+#include <signal.h>
 #define BUFLEN 128
 #define SIZE 5
 char* content = NULL; //save content for show commands.
@@ -308,13 +306,15 @@ char* pop(ArrayList* a){
                         }fflush(stdout);
 
 char* ins[] = {"show","set","export","unexport","exit","wait","help","history","view"};
-char* external_ins[]={"cat", "ls", "grep","cp","mv","vi", "rm", "head", "export", "mkdir", "chown", "chmod", "pwd"};
+char* external_ins[]={"cat", "ls", "grep", "sleep", "cp","mv","vi", "rm", "head", "export", "mkdir", "chown", "chmod", "pwd"};
 char* envv[] = {"/bin/", "/sbin/", "/usr/bin/", "/usr/sbin/", "./", "/usr/local/bin/", "/usr/local/sbin/"};
 int envc = sizeof(envv)/ sizeof(envv[0]);
 ArrayList* history; //historical commands
 VarContainer* container; // contain key-value pairs
 char buffer[BUFLEN];// buffer for user input
-
+pid_t rootpid;
+pid_t bgpid;
+pid_t lastpid;
 
 typedef struct{
     char* command;
@@ -355,23 +355,60 @@ int unexport(VarContainer* container, char* key){
 void show(void){
     printf("%s\n",content);
     fflush(stdout);
+    free(content);
 }
 
 void show_check(char* str){
     if(!strcmp(str,"show")){
         char* p;
+        char* tmp;
         p = (str+5);
         p += strspn(p," ");
-        free(content);
-        content =  malloc(sizeof(char)*(strlen(p)+1));
-        strcpy(content,p);
+        tmp = strchr(p,'$');
+        if(tmp && *(tmp+1)!=0 && *(tmp+1)!=' '){
+            char* varBuffer[128];
+            char* start = p;
+            char* end = "";
+            *tmp = 0;
+            if(*(tmp+1) == '!'&&(*(tmp+2)==0||*(tmp+2)==' ')){
+                end = tmp +2;
+                sprintf(varBuffer,"%d",bgpid);
+            } else if(*(tmp+1) == '$'&&(*(tmp+2)==0||*(tmp+2)==' ')){
+                end = tmp +2;
+                sprintf(varBuffer,"%d",getpid());
+            } else{
+                char* endStr = strchr(tmp+2,' ');
+                if(endStr){
+                    *endStr = 0 ;
+                    end = endStr+1;
+                }
+                char* value = getValue(tmp+1,container);
+                if(value){
+                    strcpy(varBuffer,(value));
+                    if(strcmp(end,"")){
+                        strcat(varBuffer," ");
+                    }
+                } else{
+                    perror("Variable doesn't exist!");
+                    free(content);
+                    return;
+                }
+            }
+            content = malloc(sizeof(char)*(strlen(start)+strlen(end)+128+1));
+            strcat(content,start);
+            strcat(content,varBuffer);
+            strcat(content,end);
+        } else{
+            content =  malloc(sizeof(char)*(strlen(p)+1));
+            strcpy(content,p);
+        }
     }
 
 }
 
 long* _isNumber(char* str, long* acc){
     char* pEnd;
-    long int i = strtol(str,&pEnd,0);
+    long int i = strtol(str,&pEnd,10);
     if(str+strlen(str) == pEnd) {
         *acc = i;
         return acc;
@@ -388,7 +425,24 @@ void xssh_exit(char** argv){
     } else exit(1);
 }
 
-void xssh_wait(void){
+void xssh_wait(char** argv){
+    if(!strcmp(argv[1],"-1")){
+        printf("Waiting for all child processes.\n");
+        fflush(stdout);
+        while(waitpid(-1,NULL,0) > 0);
+        printf("All processes teminated\n");
+        fflush(stdout);
+    } else{
+        long cpid;
+        printf("Waiting for child process\n");
+        if((!_isNumber(argv[1],&cpid)) || (waitpid((pid_t)cpid,NULL,0)) < 0){
+            perror("Invalid child PID\n");
+            return;
+        }
+        printf("Child process teminated\n");
+        fflush(stdout);
+    }
+
 
 }
 
@@ -397,7 +451,7 @@ void xssh_help(void){
 Team member: Ge Gao; Shang-Yung Hsu\n\n\
 Supported instruction:(xssh instructions have higher priority than shell instructions.)\n\
                  xssh: \"show\",\"set\",\"export\",\"unexport\",\"exit\",\"wait\",\"help\",\"history\",\"view\" \n\
-                shell: \"cat\", \"ls\", \"grep\",\"cp\",\"mv\",\"vi\", \"rm\", \"head\", \"export\", \"mkdir\", \"chown\", \"chmod\", \"pwd\"\n\n\
+                shell: \"cat\", \"ls\", \"grep\", \"sleep\", \"cp\",\"mv\",\"vi\", \"rm\", \"head\", \"export\", \"mkdir\", \"chown\", \"chmod\", \"pwd\"\n\n\
 Default path for shell instructions: \"/bin/\", \"/sbin/\", \"/usr/bin/\", \"/usr/sbin/\", \"./\", \"/usr/local/bin/\", \"/usr/local/sbin/\"\n\n\
 Finished optional (a), (b) and (c). \n\n\
 You can use pipe and file redirection(support both external instruction and internal instruction) at same time(e.g. show | cat > file) but \n\
@@ -409,6 +463,7 @@ set and xssh unexport instructions.\n\
 \"view\" and \"history\" instruction can be used for showing current variables and history commands respectively.\n\
 "\
     );
+    fflush(stdout);
 }
 
 int history_check(char* str){
@@ -442,6 +497,22 @@ void substitute(char** argv, VarContainer* container){
     }
     int index = 0;
     while(argv[index]) {
+        if(!strcmp(argv[index],"$!")){
+            char* str = realloc(argv[index], sizeof(char)*21);
+            if(str){
+                sprintf(str,"%d",getpid());
+                argv[index] = str;}
+            continue;
+        }
+
+        if(!strcmp(argv[index],"$$")){
+            char* str = realloc(argv[index], sizeof(char)*21);
+            if(str){
+                sprintf(str,"%d",getpid());
+                argv[index] = str;}
+            continue;
+        }
+
 
         char* tmp = getValue(argv[index],container);
         if(tmp){
@@ -458,6 +529,25 @@ void showHistory(void){
 
 void view(void){
     showVar(container);
+}
+
+
+void ctrlsig(int sig){
+    signal(SIGINT, ctrlsig);
+    if(rootpid != lastpid){
+        if(kill(lastpid,SIGKILL)>=0){
+            lastpid = rootpid;
+            printf("-xssh: Exit pid childpid");
+        } else{
+            perror("error:");
+        }
+
+    }
+
+}
+
+void catchctrlc(){
+    signal(SIGINT,&ctrlsig);
 }
 
 /*--------------------------INITIALIZE INTERNAL INSTRUCTION END--------------------------*/
@@ -579,19 +669,19 @@ ArrayList* pipeSplit(char* str){
 
 int execute(ArrayList* blockList, char* envv[], int envc, VarContainer* container) {
     for (int k = 0; k < blockList->size; k++) {  //execute every block
-        int waitFlag=1;
+        int waitFlag = 1;
         int instr_index;
-        int cpid;
+        pid_t cpid;
         char* bg;
         Block *block = (Block *) (blockList->list[k]);
         if((bg = strchr(block->command,'&'))){
             *bg = 0;
-            waitFlag = 0;
+            waitFlag = 0;// put it in background
         }
 /*--------------------------CONVERT COMMAND TO AN ARRAY--------------------------*/
         char *p = strtok(block->command, " ");
         show_check(p);
-        if(history_check(p)){
+        if(history_check(p)){//check if it's historical instruction like %1
             pop(history);
             if(k != 0){
                 perror("invalid instruction");
@@ -617,65 +707,73 @@ int execute(ArrayList* blockList, char* envv[], int envc, VarContainer* containe
                 case 0:
                     if ((cpid = fork()) == 0) {
                         io_check
-                        show(argv);
+                        show();
                         exit(0);
                     } else {
-                        if(waitFlag){
-                            sleep(1);
+                        if(waitFlag && cpid != rootpid){
+                            lastpid = cpid;
+                            waitpid(cpid,NULL,0);
+                        } else{
+                            bgpid = cpid;
                         }
-                        int status;
                     }
                     break;
                 case 1:
-                    if ((cpid = fork()) == 0) {
-                        io_check
-                        set(container,argv[1],argv[2]);
-                        exit(0);
-                    } else {
-                        if(waitFlag){
-                            sleep(1);
-                        }
-                        int status;
-                    }
+                    set(container,argv[1],argv[2]);
                     break;
                 case 2:
-                    if ((cpid = fork()) == 0) {
-                        io_check
-                        export(container,argv[1]);
-                        exit(0);
-                    } else {
-                        if(waitFlag){
-                            sleep(1);
-                        }
-                        int status;
-                    }
+                    export(container,argv[1]);
                     break;
                 case 3:
-                     if ((cpid = fork()) == 0) {
-                        io_check
-                        unexport(container,argv[1]);
-                        exit(0);
-                    } else {
-                        if(waitFlag){
-                            sleep(1);
-                        }
-                        int status;
-                    }
+                    unexport(container,argv[1]);
                     break;
                 case 4:
                     xssh_exit(argv);
                     break;
                 case 5:
-                    xssh_wait();
+                    xssh_wait(argv);
                     break;
                 case 6:
-                    xssh_help();
+                    if ((cpid = fork()) == 0) {
+                        io_check
+                        xssh_help();
+                        exit(0);
+                    } else {
+                        if(waitFlag && cpid != rootpid){
+                            lastpid = cpid;
+                            waitpid(cpid,NULL,0);
+                        } else{
+                            bgpid = cpid;
+                        }
+                    }
                     break;
                 case 7:
-                    showHistory();
+                    if ((cpid = fork()) == 0) {
+                        io_check
+                        showHistory();
+                        exit(0);
+                    } else {
+                        if(waitFlag && cpid != rootpid){
+                            lastpid = cpid;
+                            waitpid(cpid,NULL,0);
+                        }else{
+                            bgpid = cpid;
+                        }
+                    }
                     break;
                 case 8:
-                    view();
+                    if ((cpid = fork()) == 0) {
+                        io_check
+                        view();
+                        exit(0);
+                    } else {
+                        if(waitFlag && cpid != rootpid){
+                            lastpid = cpid;
+                            waitpid(cpid,NULL,0);
+                        }else{
+                            bgpid = cpid;
+                        }
+                    }
                     break;
                 default:
                     perror("Invalid internal instruction");
@@ -693,15 +791,16 @@ int execute(ArrayList* blockList, char* envv[], int envc, VarContainer* containe
                 if (access(filePath, X_OK)) { // when the file exists and is executable
                     continue;
                 }
-
                 if ((cpid = fork()) == 0) {
                     io_check
-                    printf("%d", execv(filePath, argv));
+                    execv(filePath, argv);
                 } else {
-                    if(waitFlag){
-                        sleep(1);
+                    if(waitFlag && cpid != rootpid){
+                        lastpid = cpid;
+                        waitpid(cpid,NULL,0);
+                    }else{
+                        bgpid = cpid;
                     }
-                    int status;
                     free(filePath);
                     break;
                 }
@@ -718,9 +817,15 @@ int execute(ArrayList* blockList, char* envv[], int envc, VarContainer* containe
 }
 
 /*our xssh will parse user variable if and only if the variable has a key-value pair!
+ *
  * If type command lines as following order: 1. "export dir" 2."ls dir". The xssh will not consider dir as a user defined variable.
  * The xssh will replace the variables if it receives command lines like this: 1."export dir" 2."set dir Desktop/myfolder" 3."ls dir"
- * (same as "ls Desktop/myfolder")*/
+ * (same as "ls Desktop/myfolder")
+ *
+ * If you want to print a variable by using "show" command, you need to add a $ sign before your varibale name.(Executing 1."export x" 2."set
+ * x variable" 3."show this is $x" will print out "this is variable". Only support one variable including $$ or $!. If you input more than one
+ * variables in the show arguments, the other variable(s) will not be parsed!)
+ * */
 void run(char* buffer){
     printf(">>>");
     push(history,fgets(buffer,BUFLEN,stdin));
@@ -733,11 +838,12 @@ void run(char* buffer){
 }
 
 int main(){
+    rootpid = getpid();
+    lastpid = rootpid;
     history = AL_init();
     container = VC_init();
-    int i = 0;
-    while (i<10){// need control+c handeler....
-        i++;
+    catchctrlc();
+    while (1){
         run(buffer);
     }
 }
